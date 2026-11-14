@@ -48,6 +48,7 @@ jobs:
           COOLDOWN_SPRINT_MIN: ${{ vars.COOLDOWN_SPRINT_MIN }}
           SABOTAJE_CADA_MIN: ${{ vars.SABOTAJE_CADA_MIN }}
           SABOTAJE_MAX: ${{ vars.SABOTAJE_MAX }}
+          CONFLICTO_DESDE_PR: ${{ vars.CONFLICTO_DESDE_PR }}
 
       # Las fusiones y sabotajes hechos con GITHUB_TOKEN no disparan otros workflows "on: push",
       # así que el despliegue de la página se lanza explícitamente.

@@ -52,6 +52,9 @@ SABOTAJE_CADA = (timedelta(minutes=int(os.environ["SABOTAJE_CADA_MIN"]))
                  if os.environ.get("SABOTAJE_CADA_MIN") else None)
 SABOTAJE_MAX = int(os.environ.get("SABOTAJE_MAX") or 5)
 PREFIJO_SABOTAJE = "Sabotaje del bot:"
+PREFIJO_SABOTAJE_DIRIGIDO = "Sabotaje dirigido del bot:"  # distinto, para no reiniciar el reloj del sabotaje aleatorio
+# Si existe, en la PR número N de cada alumno (y siguientes) el bot provoca un conflicto antes de fusionar.
+CONFLICTO_DESDE_PR = int(os.environ.get("CONFLICTO_DESDE_PR") or 0)
 
 CELDA_RE = re.compile(
     r'^\s*<div class="cell(?: (?P<color>[a-z-]+))?" id="c-(?P<fila>\d+)-(?P<col>\d+)" title="[^"]*"></div>\s*$'
@@ -120,12 +123,18 @@ def fecha(iso):
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
+def comentado(numero, clave):
+    """True si el bot ya ha dejado en la PR un comentario con esa clave."""
+    marca = f"<!-- pixelbot:{clave} -->"
+    return any(c["user"]["login"] == BOT and marca in (c.get("body") or "")
+               for c in paginar(f"/repos/{REPO}/issues/{numero}/comments?per_page=100"))
+
+
 def comentar_una_vez(numero, clave, texto):
     """Comenta en la PR salvo que el bot ya haya dejado un comentario con esa clave."""
     marca = f"<!-- pixelbot:{clave} -->"
-    for c in paginar(f"/repos/{REPO}/issues/{numero}/comments?per_page=100"):
-        if c["user"]["login"] == BOT and marca in (c.get("body") or ""):
-            return
+    if comentado(numero, clave):
+        return
     api("POST", f"/repos/{REPO}/issues/{numero}/comments", {"body": f"{marca}\n{texto}"})
 
 
@@ -248,6 +257,7 @@ class Contexto:
         self.rama = get(f"/repos/{REPO}")["default_branch"]
         self.ahora = datetime.now(TZ)
         self.fusionadas = 0
+        self.sabotajes_dirigidos = 0
         texto, _ = api("GET", f"/repos/{REPO}/contents/{ARCHIVO}?ref={self.rama}", raw=True)
         self.lienzo = {}
         for linea in texto.splitlines():
@@ -300,6 +310,20 @@ def procesar(pr, ctx):
         comentar_una_vez(numero, f"en-espera:{sha}:{ctx.ahora.date()}", f"⏳ {espera}")
         return
 
+    # Conflicto didáctico: en la PR número CONFLICTO_DESDE_PR (y siguientes) de cada alumno, el bot
+    # toca antes la misma celda en main, así que la PR tiene conflicto y hay que resolverlo.
+    if (CONFLICTO_DESDE_PR and len(ctx.historial.get(autor, [])) + 1 >= CONFLICTO_DESDE_PR
+            and not comentado(numero, f"conflicto-forzado:{numero}")):
+        malo = random.choice([c for c in COLORES_SABOTAJE if c != color])
+        if pintar_mal(ctx, fila, col, malo, PREFIJO_SABOTAJE_DIRIGIDO):
+            ctx.sabotajes_dirigidos += 1
+            poner_estado(pr, "conflicto")
+            comentar_una_vez(numero, f"conflicto-forzado:{numero}", "🤖 ¡Sabotaje! Acabo de pintar tu celda "
+                             f"({fila}, {col}) de `{malo}` en `main`, así que tu PR ahora tiene un conflicto.")
+            comentar_una_vez(numero, f"conflicto:{sha}", MENSAJE_CONFLICTO.format(repo=REPO))
+            print(f"#{numero}: conflicto forzado en ({fila}, {col}) ({autor})")
+        return
+
     detalle = get(f"/repos/{REPO}/pulls/{numero}")
     if detalle["mergeable"] is None:
         return  # GitHub aún está calculando si hay conflictos: se mira en la próxima ejecución
@@ -349,26 +373,32 @@ def sabotear(ctx):
         return 0
     fila, col = random.choice(vacias)
     color = random.choice([c for c in COLORES_SABOTAJE if c != objetivo_de(fila, col)])
+    if not pintar_mal(ctx, fila, col, color, PREFIJO_SABOTAJE):
+        return 0
+    print(f"Sabotaje: celda ({fila}, {col}) pintada de {color}")
+    return 1
 
+
+def pintar_mal(ctx, fila, col, color, prefijo):
+    """Commit directo en la rama principal que deja la celda con `color`. Devuelve True si lo ha hecho."""
     # Se lee el archivo de nuevo: puede haber cambiado con las fusiones de esta misma ejecución.
     archivo = get(f"/repos/{REPO}/contents/{ARCHIVO}?ref={ctx.rama}")
     texto = base64.b64decode(archivo["content"]).decode("utf-8")
-    texto, cambios = re.subn(rf'(<div class="cell)(" id="c-{fila}-{col}")', rf"\1 {color}\2", texto, count=1)
+    texto, cambios = re.subn(rf'(<div class="cell)(?: [a-z-]+)?(" id="c-{fila}-{col}")', rf"\1 {color}\2", texto, count=1)
     if cambios != 1:
-        return 0  # la celda ya no está vacía; se intentará en la próxima ejecución
+        return False  # no se ha encontrado la celda; se intentará en la próxima ejecución
     try:
         api("PUT", f"/repos/{REPO}/contents/{ARCHIVO}", {
-            "message": f"{PREFIJO_SABOTAJE} pinta la celda ({fila}, {col}) de {color}",
+            "message": f"{prefijo} pinta la celda ({fila}, {col}) de {color}",
             "content": base64.b64encode(texto.encode("utf-8")).decode("ascii"),
             "sha": archivo["sha"],
             "branch": ctx.rama,
         })
     except urllib.error.HTTPError as error:
         print(f"No se pudo sabotear (HTTP {error.code}). ¿Está protegida la rama {ctx.rama}?")
-        return 0
+        return False
     ctx.lienzo[(fila, col)] = color
-    print(f"Sabotaje: celda ({fila}, {col}) pintada de {color}")
-    return 1
+    return True
 
 
 def main():
@@ -394,7 +424,7 @@ def main():
     if salida:
         with open(salida, "a", encoding="utf-8") as f:
             f.write(f"fusionadas={ctx.fusionadas}\n")
-            f.write(f"cambios={ctx.fusionadas + saboteadas}\n")
+            f.write(f"cambios={ctx.fusionadas + saboteadas + ctx.sabotajes_dirigidos}\n")
 
 
 if __name__ == "__main__":
